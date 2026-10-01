@@ -11,3 +11,10 @@ libs/
 CMakeFiles/
 CMakeCache.txt
 cmake_install.cmake
+
+# runtime artifacts
+package-scanner-output/
+__pycache__/
+*.pyc
+watchdog.log
+*.dmp

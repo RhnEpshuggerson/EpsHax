@@ -25,6 +25,7 @@
 #include <cstdio>
 #include <cstdarg>
 #include <map>
+#include <string>
 #include <vector>
 
 namespace epshook {
@@ -543,15 +544,112 @@ static void ThawAll(std::vector<HANDLE>& threads, const std::vector<IPRewind>& r
     }
 }
 
+// ─── anti-tamper bypass: raw NtProtectVirtualMemory syscall ───────────
+// Growtopia patches ntdll!NtProtectVirtualMemory (5-byte JMP at the entry)
+// and answers STATUS_ACCESS_DENIED for protect-changes whose target lies in
+// the game image — kernel32!VirtualProtect then fails with err=5 on game
+// .text while ws2_32/opengl32 pages pass (verified live 2026-10-01). Every
+// other Nt* we use is unhooked. Bypass the hooked entry with a direct
+// syscall; the SSN is parsed from the ON-DISK ntdll (always clean, same OS
+// build as the loaded copy) with 0x50 as this build's fallback.
+typedef LONG(NTAPI* NtPVM_t)(HANDLE, PVOID*, PSIZE_T, ULONG, PULONG);
+static NtPVM_t g_Pvm = nullptr;
+
+static DWORD ParsePvmSSN() {
+    wchar_t dir[MAX_PATH];
+    UINT n = GetSystemDirectoryW(dir, MAX_PATH);
+    if (!n) return 0x50;
+    std::wstring path(dir, n);
+    path += L"\\ntdll.dll";
+    HANDLE hf = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                            nullptr, OPEN_EXISTING, 0, nullptr);
+    if (hf == INVALID_HANDLE_VALUE) return 0x50;
+    LARGE_INTEGER sz{};
+    GetFileSizeEx(hf, &sz);
+    if (sz.QuadPart <= 0 || sz.QuadPart > 64 * 1024 * 1024) { CloseHandle(hf); return 0x50; }
+    std::vector<uint8_t> img((size_t)sz.QuadPart);
+    DWORD rd = 0;
+    BOOL ok = ReadFile(hf, img.data(), (DWORD)img.size(), &rd, nullptr);
+    CloseHandle(hf);
+    if (!ok || rd != img.size()) return 0x50;
+    DWORD ssn = 0;
+    do {
+        if (img.size() < 0x200) break;
+        DWORD e = *(const DWORD*)&img[0x3C];
+        if ((size_t)e + 0x108 > img.size()) break;
+        WORD magic = *(const WORD*)&img[(size_t)e + 24];
+        size_t dd = (size_t)e + 24 + (magic == 0x20B ? 112 : 96);
+        if (dd + 15 * 8 > img.size()) break;
+        DWORD erva = *(const DWORD*)&img[dd + 14 * 8];
+        if (!erva || (size_t)erva + 40 > img.size()) break;
+        DWORD nn   = *(const DWORD*)&img[erva + 24];
+        DWORD funcs= *(const DWORD*)&img[erva + 28];
+        DWORD names= *(const DWORD*)&img[erva + 32];
+        DWORD ords = *(const DWORD*)&img[erva + 36];
+        for (DWORD i = 0; i < nn; i++) {
+            DWORD nr = *(const DWORD*)&img[(size_t)names + (size_t)i * 4];
+            if ((size_t)nr >= img.size()) continue;
+            if (strcmp((const char*)&img[nr], "NtProtectVirtualMemory") != 0) continue;
+            WORD oi = *(const WORD*)&img[(size_t)ords + (size_t)i * 2];
+            DWORD frva = *(const DWORD*)&img[(size_t)funcs + (size_t)oi * 4];
+            if ((size_t)frva + 8 > img.size()) break;
+            const uint8_t* c = &img[frva];
+            // clean stub: mov r10, rcx ; mov eax, imm32
+            if (c[0] == 0x4C && c[1] == 0x8B && c[2] == 0xD1 && c[3] == 0xB8)
+                ssn = *(const DWORD*)(c + 4);
+            break;
+        }
+    } while (0);
+    return ssn ? ssn : 0x50;
+}
+
+static NtPVM_t BuildPvmSyscall() {
+    if (g_Pvm) return g_Pvm;
+    DWORD ssn = ParsePvmSSN();
+    // RWX from birth: the stub's own VirtualProtect would hit the same hook
+    uint8_t* p = (uint8_t*)VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE,
+                                        PAGE_EXECUTE_READWRITE);
+    if (!p) return nullptr;
+    static const uint8_t kPrologue[] = { 0x4C, 0x8B, 0xD1 };   // mov r10, rcx
+    uint8_t code[12];
+    memcpy(code, kPrologue, 3);
+    code[3] = 0xB8;                                             // mov eax, ssn
+    memcpy(code + 4, &ssn, 4);
+    code[8] = 0x0F; code[9] = 0x05;                             // syscall
+    code[10] = 0xC3;                                            // ret
+    memcpy(p, code, sizeof(code));
+    FlushInstructionCache(GetCurrentProcess(), p, sizeof(code));
+    g_Pvm = (NtPVM_t)p;
+    return g_Pvm;
+}
+
+static bool SysProtect(void* addr, SIZE_T len, DWORD prot, DWORD* outOld) {
+    NtPVM_t pvm = BuildPvmSyscall();
+    if (pvm) {
+        PVOID base = addr;
+        SIZE_T region = len;
+        ULONG old = 0;
+        if (pvm(GetCurrentProcess(), &base, &region, prot, &old) >= 0) {
+            if (outOld) *outOld = old;
+            return true;
+        }
+        // kernel rejected it (bad args etc.) — kernel32 fallback
+    }
+    DWORD old2 = 0;
+    if (!VirtualProtect(addr, len, prot, &old2)) return false;
+    if (outOld) *outOld = old2;
+    return true;
+}
+
 // ─── patch writer ─────────────────────────────────────────────────────
 
 static bool WriteBytes(void* addr, const uint8_t* bytes, int len, DWORD* outOldProt) {
     DWORD oldProt = 0;
-    if (!VirtualProtect(addr, (SIZE_T)len, PAGE_EXECUTE_READWRITE, &oldProt)) return false;
+    if (!SysProtect(addr, (SIZE_T)len, PAGE_EXECUTE_READWRITE, &oldProt)) return false;
     if (outOldProt) *outOldProt = oldProt;
     memcpy(addr, bytes, (size_t)len);
     DWORD tmp = 0;
-    VirtualProtect(addr, (SIZE_T)len, oldProt, &tmp);
+    SysProtect(addr, (SIZE_T)len, oldProt, &tmp);
     FlushInstructionCache(GetCurrentProcess(), addr, (SIZE_T)len);
     return true;
 }
@@ -683,7 +781,10 @@ static Status InstallImpl(void* target, void* hookOrDispatch, void** original, b
     ThawAll(frozen, rewrites);
 
     if (!wrote) {
-        Logf("[epshook] VirtualProtect failed at %p (err=%lu)", target, GetLastError());
+        MEMORY_BASIC_INFORMATION mq{};
+        VirtualQuery(code, &mq, sizeof(mq));
+        Logf("[epshook] VirtualProtect failed at %p (err=%lu, prot=0x%lX, len=%d)",
+             target, GetLastError(), (unsigned long)mq.Protect, total);
         VirtualFree(alloc, 0, MEM_RELEASE);
         return ERR_PROTECT;
     }

@@ -80,6 +80,8 @@ target_include_directories(imgui PUBLIC
 add_library(EpsHax SHARED
     src/dllmain.cpp
     src/lua_api.cpp
+    src/lua_bothax.cpp
+    src/itemdb.cpp
     src/hook.cpp
     src/scanner.cpp
     src/native_hook.cpp
@@ -90,6 +92,20 @@ add_library(EpsHax SHARED
 target_include_directories(EpsHax PRIVATE src)
 target_link_libraries(EpsHax PRIVATE imgui lua opengl32 ws2_32 winhttp)
 target_compile_definitions(EpsHax PRIVATE EPSHAX_EXPORTS)
+# CreativeGrowtopia.exe holds build\Debug\EpsHax.dll open (loaded) and
+# Growtopia holds EpsHax3 — link side-by-side; inject_run.py picks newest.
+set_target_properties(EpsHax PROPERTIES OUTPUT_NAME "EpsHax6")
+
+# ── bothax API host test (no game — stubs in test/stubs.cpp) ────────────
+add_executable(ApiTest
+    test/api_test.cpp
+    test/stubs.cpp
+    src/lua_api.cpp
+    src/lua_bothax.cpp
+    src/itemdb.cpp
+)
+target_include_directories(ApiTest PRIVATE src test)
+target_link_libraries(ApiTest PRIVATE lua winhttp user32 shell32 ws2_32)
 
 # ── Discord rich presence smoke test ───────────────────────────────────
 add_executable(DiscordRpcTest test/rpc_test.cpp src/discord_rpc.cpp)
