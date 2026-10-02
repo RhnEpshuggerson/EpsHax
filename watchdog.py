@@ -22,6 +22,8 @@ CRASH_DIR = os.path.join(BASE, "package-scanner-output", "Crash log")
 DUMP_DIR = os.path.join(os.environ.get("LOCALAPPDATA", ""), "CrashDumps")
 NOOP = r"C:\Users\LENOVO\AppData\Local\Temp\opencode\noop.lua"
 STATE_PROBE = r"C:\Users\LENOVO\AppData\Local\Temp\opencode\state_probe.lua"
+USER_SCRIPT = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Growtopia",
+                           "EpsScript", "coems_epshax_stub.lua")
 GT_LAUNCH = os.path.join(BASE, "gt_launch.py")
 INJECT = os.path.join(BASE, "inject_run.py")
 
@@ -269,6 +271,16 @@ def wait_for_gt(timeout=40):
     return False
 
 
+def restore_user_script():
+    """Re-run the user's suite after a crash-recovery so AFK work resumes."""
+    if not os.path.isfile(USER_SCRIPT):
+        wlog("WARN user script missing: %s" % USER_SCRIPT)
+        return
+    r = run_py(INJECT, [USER_SCRIPT, GT_EXE], timeout=200)
+    wlog("user script inject rc=%s %s"
+         % (r.returncode, (r.stdout or "").strip()[-200:]))
+
+
 def relaunch_cycle(fail_count):
     wlog("GT not running -> recovery (fail_count=%d)" % fail_count)
     collect_crash_info(time.time() - 120)
@@ -295,6 +307,7 @@ def relaunch_cycle(fail_count):
     wlog("verify: ok=%s %s" % (ok, detail))
     if ok:
         wlog("recovery SUCCESS")
+        restore_user_script()
         return 0
     # menu might have been missed — try clicking again
     for i in range(1, VERIFY_TRIES):
@@ -305,6 +318,7 @@ def relaunch_cycle(fail_count):
         wlog("verify: ok=%s %s" % (ok, detail))
         if ok:
             wlog("recovery SUCCESS after retry")
+            restore_user_script()
             return 0
     wlog("recovery FAILED after %d tries" % VERIFY_TRIES)
     return fail_count + 1

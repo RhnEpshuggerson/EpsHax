@@ -13,7 +13,7 @@ _DBG = r"C:\Users\LENOVO\Documents\groetopia\cv dl script\coems_executor\build\D
 # newest built DLL — EpsHax2/3.dll exist while other builds are file-locked
 # by loaded processes; EpsHax3 is the current instrumented build
 _candidates = [os.path.join(_DBG, n)
-               for n in ("EpsHax6.dll", "EpsHax5.dll", "EpsHax4.dll", "EpsHax3.dll", "EpsHax2.dll", "EpsHax.dll")]
+               for n in ("EpsHax7.dll", "EpsHax6.dll", "EpsHax5.dll", "EpsHax4.dll", "EpsHax3.dll", "EpsHax2.dll", "EpsHax.dll")]
 DLL_PATH = max((p for p in _candidates if os.path.isfile(p)),
                key=os.path.getmtime, default=_candidates[0])
 

@@ -94,7 +94,7 @@ target_link_libraries(EpsHax PRIVATE imgui lua opengl32 ws2_32 winhttp)
 target_compile_definitions(EpsHax PRIVATE EPSHAX_EXPORTS)
 # CreativeGrowtopia.exe holds build\Debug\EpsHax.dll open (loaded) and
 # Growtopia holds EpsHax3 — link side-by-side; inject_run.py picks newest.
-set_target_properties(EpsHax PROPERTIES OUTPUT_NAME "EpsHax6")
+set_target_properties(EpsHax PROPERTIES OUTPUT_NAME "EpsHax7")
 
 # ── bothax API host test (no game — stubs in test/stubs.cpp) ────────────
 add_executable(ApiTest
@@ -115,3 +115,9 @@ target_include_directories(DiscordRpcTest PRIVATE src)
 add_executable(EpsHaxLoader src/loader.cpp)
 target_link_libraries(EpsHaxLoader PRIVATE user32 advapi32 shell32 psapi)
 target_link_options(EpsHaxLoader PRIVATE "/MANIFESTUAC:level='requireAdministrator'")
+
+# ── EpsHaxLauncher: GUI (Play / Scripts / Logs) for Growtopia & Creative ──
+add_executable(EpsHaxLauncher WIN32 src/launcher.cpp)
+target_compile_options(EpsHaxLauncher PRIVATE /utf-8)
+target_link_libraries(EpsHaxLauncher PRIVATE user32 advapi32 shell32 comctl32)
+target_link_options(EpsHaxLauncher PRIVATE "/MANIFESTUAC:level='requireAdministrator'")

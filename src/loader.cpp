@@ -318,6 +318,11 @@ static bool InjectDll(HANDLE hProc, const char* dllPath) {
 }
 
 // ── main ──────────────────────────────────────────────────────────────
+static bool g_quiet = false;
+static void MaybePause() {
+    if (!g_quiet) system("pause");
+}
+
 static HANDLE OpenTarget(DWORD pid) {
     return OpenProcess(PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION |
         PROCESS_VM_WRITE | PROCESS_VM_READ | PROCESS_QUERY_INFORMATION,
@@ -341,12 +346,28 @@ static bool IsAlreadyInjected(DWORD pid, const char* dllName) {
     return found;
 }
 
-static bool LaunchGrowtopia(HANDLE* outProc, DWORD* outPid) {
+static std::wstring A2W(const char* s) {
+    if (!s || !*s) return {};
+    int n = MultiByteToWideChar(CP_ACP, 0, s, -1, nullptr, 0);
+    std::wstring w(n > 0 ? n - 1 : 0, 0);
+    if (n > 1) MultiByteToWideChar(CP_ACP, 0, s, -1, &w[0], n);
+    return w;
+}
+
+static bool LaunchGame(const char* exeNameA, HANDLE* outProc, DWORD* outPid) {
+    std::wstring exeNameW = A2W(exeNameA);
+    std::wstring dirName = exeNameW;
+    if (dirName.size() > 4 && _wcsicmp(dirName.c_str() + dirName.size() - 4, L".exe") == 0)
+        dirName.resize(dirName.size() - 4);
     wchar_t exePath[MAX_PATH]{};
-    if (SUCCEEDED(SHGetFolderPathW(nullptr, 0x001C /*CSIDL_LOCAL_APPDATA*/, nullptr, 0, exePath)))
-        wcscat_s(exePath, L"\\Growtopia\\Growtopia.exe");
+    if (SUCCEEDED(SHGetFolderPathW(nullptr, 0x001C /*CSIDL_LOCAL_APPDATA*/, nullptr, 0, exePath))) {
+        wcscat_s(exePath, L"\\");
+        wcscat_s(exePath, dirName.c_str());
+        wcscat_s(exePath, L"\\");
+        wcscat_s(exePath, exeNameW.c_str());
+    }
     if (GetFileAttributesW(exePath) == INVALID_FILE_ATTRIBUTES) {
-        Fail("Growtopia.exe not found at %ls", exePath);
+        Fail("%s not found at %ls", exeNameA, exePath);
         return false;
     }
     STARTUPINFOW si{};
@@ -361,7 +382,7 @@ static bool LaunchGrowtopia(HANDLE* outProc, DWORD* outPid) {
     CloseHandle(pi.hThread);
     *outProc = pi.hProcess;
     *outPid = pi.dwProcessId;
-    Log("[+] Growtopia started (pid %lu)", pi.dwProcessId);
+    Log("[+] %s started (pid %lu)", exeNameA, pi.dwProcessId);
     return true;
 }
 
@@ -378,7 +399,7 @@ static bool InjectOne(DWORD pid, const std::string& dllPath, const char* dllName
 
     // wait for main window (up to 90s)
     if (!ProcessHasWindow(pid)) {
-        Log("[*] Waiting for Growtopia window (pid %lu)...", pid);
+        Log("[*] Waiting for game window (pid %lu)...", pid);
         if (!WaitForProcessWindow(pid, 90)) {
             Log("[-] pid %lu: no window after 90s — injecting anyway", pid);
         }
@@ -396,25 +417,40 @@ static bool InjectOne(DWORD pid, const std::string& dllPath, const char* dllName
 }
 
 int main(int argc, char** argv) {
-    SetConsoleTitleA("EpsHax Loader");
-    printf("============================\n");
-    printf("   EpsHax Loader v4 (new instance per run)\n");
-    printf("============================\n\n");
-
-    // Parse args:
+    // Parse args FIRST so -q stays fully silent.
     //   (none)          → launch 1 NEW Growtopia, inject ONLY into it
     //   -n N            → launch N new instances, inject ONLY into those
     //   -n 0            → inject ALL running instances (no launch)
-    //   <dllpath>       → drag-drop DLL
+    //   -e <exeName>    → target game: Growtopia.exe (default) | CreativeGrowtopia.exe
+    //   -p <pid>        → inject ONLY into this pid (no launch) — for wrappers/launcher
+    //   -q              → quiet: no banner, no pause, machine-friendly output
+    //   <dllpath>       → drag-drop DLL / explicit path
     int launchCount = 1; // default: always a fresh EpsHax-only instance
+    DWORD onlyPid = 0;
+    std::string exeName = "Growtopia.exe";
     std::string dllPath;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
             launchCount = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-e") == 0 && i + 1 < argc) {
+            exeName = argv[++i];
+        } else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
+            onlyPid = (DWORD)strtoul(argv[++i], nullptr, 10);
+        } else if (strcmp(argv[i], "-q") == 0) {
+            g_quiet = true;
         } else {
             dllPath = argv[i];
         }
     }
+    if (onlyPid) launchCount = 0;
+
+    if (!g_quiet) {
+        SetConsoleTitleA("EpsHax Loader");
+        printf("============================\n");
+        printf("   EpsHax Loader v5\n");
+        printf("============================\n\n");
+    }
+
     if (dllPath.empty()) {
         char exePath[MAX_PATH]{};
         GetModuleFileNameA(nullptr, exePath, MAX_PATH);
@@ -425,8 +461,8 @@ int main(int argc, char** argv) {
     }
     if (GetFileAttributesA(dllPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
         Fail("DLL not found: %s", dllPath.c_str());
-        Log("Usage: EpsHaxLoader [-n instanceCount] [dllPath]  (default: 1 new instance; -n 0 = inject all running)");
-        system("pause");
+        Log("Usage: EpsHaxLoader [-q] [-e exeName] [-p pid | -n instanceCount] [dllPath]");
+        MaybePause();
         return 1;
     }
     std::string dllName = dllPath.substr(dllPath.find_last_of("\\/") + 1);
@@ -434,34 +470,37 @@ int main(int argc, char** argv) {
 
     EnableDebugPrivilege();
 
+    std::wstring exeNameW = A2W(exeName.c_str());
     std::vector<DWORD> targets;
-    if (launchCount > 0) {
-        Log("[*] Launching %d new Growtopia instance(s) (EpsHax-only, keeps existing instances untouched)...", launchCount);
+    if (onlyPid) {
+        targets.push_back(onlyPid);
+    } else if (launchCount > 0) {
+        Log("[*] Launching %d new %s instance(s) (keeps existing instances untouched)...", launchCount, exeName.c_str());
         for (int i = 0; i < launchCount; i++) {
             HANDLE hp = nullptr; DWORD pid = 0;
-            if (LaunchGrowtopia(&hp, &pid)) {
+            if (LaunchGame(exeName.c_str(), &hp, &pid)) {
                 CloseHandle(hp);
                 targets.push_back(pid);
             }
         }
         if (targets.empty()) {
             Fail("could not launch any instance");
-            system("pause");
+            MaybePause();
             return 1;
         }
         // wait a bit for processes to stabilize
         Sleep(2000);
     } else {
-        // -n 0 → inject every running instance (legacy combine behavior)
-        targets = FindAllPidsByName(L"Growtopia.exe");
+        // -n 0 (or -p handled above) → inject every running instance of exeName
+        targets = FindAllPidsByName(exeNameW.c_str());
     }
 
     if (targets.empty()) {
-        Log("[-] No Growtopia processes found");
-        system("pause");
+        Log("[-] No %s processes found", exeName.c_str());
+        MaybePause();
         return 1;
     }
-    Log("[*] Targeting %zu Growtopia instance(s)", targets.size());
+    Log("[*] Targeting %zu %s instance(s)", targets.size(), exeName.c_str());
 
     int success = 0, failed = 0, skipped = 0;
     for (DWORD pid : targets) {
@@ -475,10 +514,14 @@ int main(int argc, char** argv) {
         else failed++;
     }
 
-    printf("\n============================\n");
-    printf(" Done: %d injected, %d already had it, %d failed\n", success, skipped, failed);
-    printf(" F1 toggles the menu in each instance\n");
-    printf("============================\n");
-    system("pause");
+    if (!g_quiet) {
+        printf("\n============================\n");
+        printf(" Done: %d injected, %d already had it, %d failed\n", success, skipped, failed);
+        printf(" F1 toggles the menu in each instance\n");
+        printf("============================\n");
+    } else {
+        Log("[+] loader done: %d injected, %d skipped, %d failed", success, skipped, failed);
+    }
+    MaybePause();
     return failed ? 1 : 0;
 }

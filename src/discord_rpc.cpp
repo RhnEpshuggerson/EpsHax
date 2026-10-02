@@ -88,24 +88,40 @@ HANDLE ConnectPipe() {
     return INVALID_HANDLE_VALUE;
 }
 
-std::string BuildSetActivity() {
+std::string BuildSetActivity(bool withAssets, long long startTs) {
     const long long now = (long long)time(nullptr);
     char act[640];
-    snprintf(act, sizeof(act),
-             "{\"type\":0,"
-             "\"details\":\"%s\","
-             "\"state\":\"%s\","
-             "\"timestamps\":{\"start\":%lld},"
-             "\"assets\":{\"large_image\":\"%s\",\"large_text\":\"EpsHax\"}}",
-             kDetails, kState, now, kImage);
+    if (withAssets) {
+        snprintf(act, sizeof(act),
+                 "{\"type\":0,"
+                 "\"details\":\"%s\","
+                 "\"state\":\"%s\","
+                 "\"timestamps\":{\"start\":%lld},"
+                 "\"assets\":{\"large_image\":\"%s\",\"large_text\":\"EpsHax\"}}",
+                 kDetails, kState, startTs, kImage);
+    } else {
+        // Fallback: Discord can reject activities whose external image URL is
+        // no longer allowed — retry without assets so presence still shows.
+        snprintf(act, sizeof(act),
+                 "{\"type\":0,"
+                 "\"details\":\"%s\","
+                 "\"state\":\"%s\","
+                 "\"timestamps\":{\"start\":%lld}}",
+                 kDetails, kState, startTs);
+    }
+    (void)now;
     char msg[768];
     snprintf(msg, sizeof(msg),
              "{\"cmd\":\"SET_ACTIVITY\",\"args\":{\"pid\":%lu,\"activity\":%s},"
-             "\"nonce\":\"%lu\"}",
+             "\"nonce\":\"%llu-%llu\"}",
              (unsigned long)GetCurrentProcessId(), act,
-             (unsigned long)GetTickCount());
+             (unsigned long long)GetTickCount64(),
+             (unsigned long long)GetCurrentProcessId());
     return msg;
 }
+
+constexpr DWORD kRefreshMs = 10 * 60 * 1000;  // re-send presence every 10 min
+constexpr DWORD kPollMs = 250;
 
 DWORD WINAPI ThreadMain(LPVOID) {
     bool waitLogged = false;
@@ -150,30 +166,66 @@ DWORD WINAPI ThreadMain(LPVOID) {
             continue;
         }
 
-        if (!SendFrame(h, OP_FRAME, BuildSetActivity())) {
+        // One start timestamp per process: refreshes keep the session timer.
+        static const long long startTs = (long long)time(nullptr);
+        static bool s_assetsFallback = false;
+        bool withAssets = !s_assetsFallback;
+        if (!SendFrame(h, OP_FRAME, BuildSetActivity(withAssets, startTs))) {
             CloseHandle(h);
             Sleep(3000);
             continue;
         }
-        Log("connected - EpsHax presence active");
+        DWORD lastSend = GetTickCount();
+        Log(s_assetsFallback
+                ? "connected - EpsHax presence active (no image)"
+                : "connected - EpsHax presence active");
 
-        bool reportPending = true;
+        bool awaitingReply = true;
+        bool fallbackTried = s_assetsFallback;
         for (;;) {
-            uint32_t op;
-            std::string p;
-            if (!ReadFrame(h, op, p)) break;
-            if (op == OP_PING) {
-                if (!SendFrame(h, OP_PONG, p)) break;
-            } else if (op == OP_CLOSE) {
-                break;
-            } else if (op == OP_FRAME && reportPending &&
-                       p.find("SET_ACTIVITY") != std::string::npos) {
-                reportPending = false;
-                if (p.find("ERROR") != std::string::npos)
-                    Log(("presence rejected: " + p).c_str());
-                else
-                    Log("presence confirmed by Discord");
+            // Poll instead of blocking so we can refresh presence periodically.
+            DWORD avail = 0;
+            if (!PeekNamedPipe(h, nullptr, 0, nullptr, &avail, nullptr)) break; // pipe gone
+            if (avail >= 8) {
+                uint32_t op;
+                std::string p;
+                if (!ReadFrame(h, op, p)) break;
+                if (op == OP_PING) {
+                    if (!SendFrame(h, OP_PONG, p)) break;
+                } else if (op == OP_CLOSE) {
+                    break;
+                } else if (op == OP_FRAME && awaitingReply &&
+                           p.find("SET_ACTIVITY") != std::string::npos) {
+                    awaitingReply = false;
+                    if (p.find("ERROR") != std::string::npos) {
+                        Log(("presence rejected: " + p).c_str());
+                        if (!fallbackTried) {
+                            // Retry once without assets (external URL may be rejected).
+                            fallbackTried = true;
+                            s_assetsFallback = true;
+                            withAssets = false;
+                            if (SendFrame(h, OP_FRAME,
+                                          BuildSetActivity(false, startTs))) {
+                                lastSend = GetTickCount();
+                                awaitingReply = true;
+                                Log("retrying presence without image...");
+                            }
+                        }
+                    } else {
+                        Log("presence confirmed by Discord");
+                    }
+                }
             }
+            DWORD now = GetTickCount();
+            if (now - lastSend >= kRefreshMs) {
+                withAssets = !s_assetsFallback;
+                if (SendFrame(h, OP_FRAME, BuildSetActivity(withAssets, startTs))) {
+                    lastSend = now;
+                    awaitingReply = true;
+                    Log("presence refreshed");
+                } else break;
+            }
+            Sleep(kPollMs);
         }
 
         Log("Discord connection lost - reconnecting");
