@@ -468,7 +468,7 @@ static std::wstring PickDll() {
     std::wstring dir = DirOf(self);
     std::wstring over = IniGet(L"dll", L"");
     if (!over.empty() && GetFileAttributesW(over.c_str()) != INVALID_FILE_ATTRIBUTES) return over;
-    const wchar_t* names[] = { L"EpsHax7.dll", L"EpsHax6.dll", L"EpsHax5.dll", L"EpsHax4.dll",
+    const wchar_t* names[] = { L"EpsHax9.dll", L"EpsHax8.dll", L"EpsHax7.dll", L"EpsHax6.dll", L"EpsHax5.dll", L"EpsHax4.dll",
                                L"EpsHax3.dll", L"EpsHax2.dll",
                                L"EpsHax.dll" };
     std::wstring best;

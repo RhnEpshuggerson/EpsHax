@@ -9,6 +9,7 @@
 #include <thread>
 #include <chrono>
 #include <windows.h>
+#include <unordered_map>
 #include <winhttp.h>
 #pragma comment(lib, "winhttp.lib")
 
@@ -568,8 +569,157 @@ int LuaExecutor::lua_SendVarlist(lua_State* L) {
     return 0;
 }
 
+// ── live gems ───────────────────────────────────────────────────────────────
+// Break-gems are credited client-side with NO OnSetBux packet, so the packet
+// value (localPlayer.gems) lags the HUD. The game keeps the live balance in
+// (at least) two identical heap copies. Find them with an equal-pair scan in
+// a window around the last known value; static pairs (thousands of id/table
+// junk pairs live nearby) are rejected by observing the pair across two scan
+// passes — only the real balance changes in lockstep while earning. Cached
+// addresses are re-read on the fast path (2 ReadProcessMemory calls); a full
+// rescan only happens if the pair breaks. Runs before the GameState lock.
+static void LiveGemsScanWindow(uint32_t lo, uint32_t hi,
+    std::unordered_map<uintptr_t, std::pair<uintptr_t, uint32_t>>& out) {
+    out.clear();
+    std::unordered_map<uint32_t, std::pair<uintptr_t, uintptr_t>> hits;
+    MEMORY_BASIC_INFORMATION mbi;
+    for (uint8_t* addr = nullptr;
+         VirtualQuery(addr, &mbi, sizeof mbi);
+         addr = (uint8_t*)mbi.BaseAddress + mbi.RegionSize) {
+        if (mbi.State != MEM_COMMIT || mbi.Type != MEM_PRIVATE) continue;
+        DWORD pr = mbi.Protect & 0xFF;
+        bool wr = pr == 0x02 || pr == 0x04 || pr == 0x08 || pr == 0x40 || pr == 0x80;
+        if (!wr || (mbi.Protect & PAGE_GUARD)) continue;
+        uint32_t* p = (uint32_t*)mbi.BaseAddress;
+        size_t cnt = mbi.RegionSize / 4;
+        for (size_t i = 0; i < cnt; i++) {
+            uint32_t v = p[i];
+            if (v < lo || v > hi) continue;
+            auto it = hits.find(v);
+            if (it == hits.end())
+                hits.emplace(v, std::make_pair((uintptr_t)&p[i], (uintptr_t)0));
+            else if (it->second.second == 0)
+                it->second.second = (uintptr_t)&p[i];
+        }
+    }
+    for (auto& kv : hits)
+        if (kv.second.second)
+            out.emplace(kv.second.first, std::make_pair(kv.second.second, kv.first));
+}
+
+static uint32_t LiveGemsPoll(uint32_t packetGems) {
+    static uint32_t s_a = 0, s_b = 0, s_last = 0, s_floor = 0;
+    static DWORD s_scanAt = 0;
+    static int s_attempt = 0;
+    if (packetGems > 1000) {
+        uint32_t fl = packetGems - packetGems / 4;
+        if (fl > s_floor) s_floor = fl;
+    }
+    auto read32 = [](uintptr_t addr, uint32_t& v) -> bool {
+        SIZE_T n = 0;
+        return ReadProcessMemory(GetCurrentProcess(), (void*)addr, &v, 4, &n) && n == 4;
+    };
+    // fast path: wallet counter lives in game ctx at +0x2D0 (client-side,
+    // updated on every break; equals what the HUD shows)
+    if (scanner::fn_GetCtx) {
+        typedef uintptr_t (*GetCtx_t)();
+        uintptr_t ctx = ((GetCtx_t)scanner::fn_GetCtx)();
+        if (ctx) {
+            uint32_t v = 0;
+            SIZE_T n = 0;
+            if (ReadProcessMemory(GetCurrentProcess(), (void*)(ctx + 0x2D0), &v, 4, &n) &&
+                n == 4 && v && v < 2000000000u) {
+                bool ok = false;
+                if (packetGems > 1000) {
+                    uint32_t fl = packetGems - packetGems / 4;
+                    if (v >= fl || v >= packetGems) ok = true;
+                }
+                if (!ok && s_last && v >= s_last) ok = true;
+                if (ok) {
+                    s_a = 0;
+                    s_b = 0;
+                    s_last = v;
+                    s_attempt = 0;
+                    static int s_ctxLogged = 0;
+                    if (s_ctxLogged < 3) {
+                        s_ctxLogged++;
+                        debugLog("[LIVEGEMS] ctx+0x2D0 = " + std::to_string(v));
+                    }
+                    return v;
+                }
+            }
+        }
+    }
+    if (s_a && s_b) {
+        uint32_t va = 0, vb = 0;
+        if (read32(s_a, va) && read32(s_b, vb) && va == vb &&
+            va >= s_floor && va <= 2000000000u) {
+            s_last = va;
+            return va;
+        }
+    }
+    DWORD now = GetTickCount();
+    DWORD gap = 3000;
+    for (int i = 0; i < s_attempt / 3 && gap < 15000; i++) gap *= 2;
+    if (s_attempt >= 3 && s_last) gap = 15000;
+    if (s_attempt && now - s_scanAt < gap)
+        return s_last ? s_last : packetGems;
+    s_scanAt = now;
+    s_attempt++;
+
+    uint32_t target = s_last ? s_last : packetGems;
+    if (!target) return 0;
+    uint32_t lo = target > 5000000u ? target - 5000000u : 0;
+    if (s_floor > lo) lo = s_floor;
+    uint32_t hi = target + 50000000u;
+    if (hi < target) hi = 0xFFFFFFFFu;
+
+    std::unordered_map<uintptr_t, std::pair<uintptr_t, uint32_t>> pass1, pass2;
+    LiveGemsScanWindow(lo, hi, pass1);
+    Sleep(350);
+    LiveGemsScanWindow(lo, hi, pass2);
+
+    uint32_t best = 0, bestDist = 0xFFFFFFFFu;
+    uintptr_t ba = 0, bb = 0;
+    for (auto& kv : pass2) {
+        auto it = pass1.find(kv.first);
+        if (it == pass1.end()) continue;
+        if (it->second.first != kv.second.first) continue;   // other copy moved
+        if (it->second.second == kv.second.second) continue; // unchanged = junk
+        uint32_t v = kv.second.second;
+        uint32_t d = v > target ? v - target : target - v;
+        if (d < bestDist) {
+            bestDist = d;
+            best = v;
+            ba = kv.first;
+            bb = kv.second.first;
+        }
+    }
+    if (best) {
+        s_a = (uint32_t)ba;
+        s_b = (uint32_t)bb;
+        s_last = best;
+        s_attempt = 0;
+        static int s_foundLogged = 0;
+        if (s_foundLogged < 5) {
+            s_foundLogged++;
+            debugLog("[LIVEGEMS] locked pair 0x" + std::to_string(ba) + "/0x" +
+                     std::to_string(bb) + " = " + std::to_string(best));
+        }
+        return best;
+    }
+    if (!s_last && packetGems) s_last = packetGems;
+    return s_last;
+}
+
 int LuaExecutor::lua_GetLocal(lua_State* L) {
     auto& gs = GameState::instance();
+    uint32_t packetGems = 0;
+    {
+        std::lock_guard<std::mutex> lk(gs.mtx);
+        packetGems = (uint32_t)gs.localPlayer.gems;
+    }
+    uint32_t liveGems = LiveGemsPoll(packetGems);
     std::lock_guard<std::mutex> lock(gs.mtx);
     auto& p = gs.localPlayer;
     {
@@ -591,7 +741,7 @@ int LuaExecutor::lua_GetLocal(lua_State* L) {
     lua_pushnumber(L, p.size_y); lua_setfield(L, -2, "size_y");
     lua_pushinteger(L, p.netid); lua_setfield(L, -2, "netid");
     lua_pushinteger(L, p.userid); lua_setfield(L, -2, "userid");
-    lua_pushinteger(L, p.gems); lua_setfield(L, -2, "gems");
+    lua_pushinteger(L, liveGems ? (lua_Integer)liveGems : p.gems); lua_setfield(L, -2, "gems");
     lua_pushboolean(L, p.facing_left); lua_setfield(L, -2, "facing_left");
     lua_pushboolean(L, p.facing_left); lua_setfield(L, -2, "isleft");
     lua_pushboolean(L, p.invisible); lua_setfield(L, -2, "invisible");

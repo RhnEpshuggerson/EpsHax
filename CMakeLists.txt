@@ -94,7 +94,7 @@ target_link_libraries(EpsHax PRIVATE imgui lua opengl32 ws2_32 winhttp)
 target_compile_definitions(EpsHax PRIVATE EPSHAX_EXPORTS)
 # CreativeGrowtopia.exe holds build\Debug\EpsHax.dll open (loaded) and
 # Growtopia holds EpsHax3 — link side-by-side; inject_run.py picks newest.
-set_target_properties(EpsHax PROPERTIES OUTPUT_NAME "EpsHax7")
+set_target_properties(EpsHax PROPERTIES OUTPUT_NAME "EpsHax9")
 
 # ── bothax API host test (no game — stubs in test/stubs.cpp) ────────────
 add_executable(ApiTest
