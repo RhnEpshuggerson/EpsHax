@@ -75,7 +75,8 @@ static int g_page = 0;
 
 static void FillAutoCombo();
 static bool ProbeWorld(HANDLE h, DWORD pid, std::wstring* out);
-static bool ClickGamePlay(DWORD pid);
+static bool ClickGamePlay(int idx, DWORD pid);
+static bool CGLoggedIn(DWORD pid);
 static void SyncAutoCheck();
 static std::wstring Utf8OrAcpToWide(const char* p, int n);
 
@@ -85,10 +86,12 @@ static std::wstring GetLocalAppData() {
     SHGetFolderPathW(nullptr, 0x001C /*CSIDL_LOCAL_APPDATA*/, nullptr, 0, p);
     return p;
 }
-static std::wstring GameDir()      { return GetLocalAppData() + kTargets[g_target].exeRel; } // parent of exe
+static std::wstring ExePathFor(int idx) { return GetLocalAppData() + kTargets[idx].exeRel; }
+static std::wstring GameDir()      { return ExePathFor(g_target); } // game exe path
 static std::wstring ExePath()      { return GameDir(); }
-static std::wstring ScriptDir()    { return GetLocalAppData() +
-    (g_target == 0 ? L"\\Growtopia\\EpsScript" : L"\\CreativeGrowtopia\\EpsScript"); }
+static std::wstring ScriptDirFor(int idx) { return GetLocalAppData() +
+    (idx == 0 ? L"\\Growtopia\\EpsScript" : L"\\CreativeGrowtopia\\EpsScript"); }
+static std::wstring ScriptDir()    { return ScriptDirFor(g_target); }
 static std::wstring IniPath() {
     std::wstring d = GetLocalAppData() + L"\\EpsHax";
     CreateDirectoryW(d.c_str(), nullptr);
@@ -468,7 +471,7 @@ static std::wstring PickDll() {
     std::wstring dir = DirOf(self);
     std::wstring over = IniGet(L"dll", L"");
     if (!over.empty() && GetFileAttributesW(over.c_str()) != INVALID_FILE_ATTRIBUTES) return over;
-    const wchar_t* names[] = { L"EpsHax9.dll", L"EpsHax8.dll", L"EpsHax7.dll", L"EpsHax6.dll", L"EpsHax5.dll", L"EpsHax4.dll",
+    const wchar_t* names[] = { L"EpsHax10.dll", L"EpsHax9.dll", L"EpsHax8.dll", L"EpsHax7.dll", L"EpsHax6.dll", L"EpsHax5.dll", L"EpsHax4.dll",
                                L"EpsHax3.dll", L"EpsHax2.dll",
                                L"EpsHax.dll" };
     std::wstring best;
@@ -497,8 +500,8 @@ static std::string WideToAcp(const std::wstring& w) {
 }
 
 // ── launch game ────────────────────────────────────────────────────────
-static bool LaunchGame(DWORD* outPid) {
-    std::wstring exe = ExePath();
+static bool LaunchGame(int idx, DWORD* outPid) {
+    std::wstring exe = ExePathFor(idx);
     if (GetFileAttributesW(exe.c_str()) == INVALID_FILE_ATTRIBUTES) {
         Log("[-] exe not found: %ls", exe.c_str());
         return false;
@@ -516,7 +519,7 @@ static bool LaunchGame(DWORD* outPid) {
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
     *outPid = pi.dwProcessId;
-    Log("[+] %ls started (pid %lu)", kTargets[g_target].label, pi.dwProcessId);
+    Log("[+] %ls started (pid %lu)", kTargets[idx].label, pi.dwProcessId);
     return true;
 }
 
@@ -604,17 +607,20 @@ static bool InjectViaLoader(const std::wstring& dllW, DWORD pid) {
 }
 
 // ── worker: play / inject / run ────────────────────────────────────────
-static bool EnsureInjected(HANDLE* hOut, DWORD* pidOut) {
-    const TargetInfo& t = kTargets[g_target];
-    std::wstring scriptDir = ScriptDir();
+// Failure paths PushEvent (log) instead of WM_APP_DONE — a string DONE
+// clears the busy flag in the UI, which would allow a second worker to
+// start while Play is still processing the other game.
+static bool EnsureInjectedIdx(int idx, HANDLE* hOut, DWORD* pidOut) {
+    const TargetInfo& t = kTargets[idx];
+    std::wstring scriptDir = ScriptDirFor(idx);
     CreateDirectoryW(scriptDir.c_str(), nullptr);
 
     std::vector<DWORD> pids = FindPids(t.proc);
     DWORD pid = 0;
     if (pids.empty()) {
         PostStr(WM_APP_STATUS, std::wstring(L"Launching ") + t.label + L"...");
-        if (!LaunchGame(&pid)) { PostStr(WM_APP_DONE, L"Launch failed"); return false; }
-        PostStr(WM_APP_STATUS, L"Waiting for game window...");
+        if (!LaunchGame(idx, &pid)) { PushEvent(L"[-] " + std::wstring(t.label) + L" launch failed"); return false; }
+        PostStr(WM_APP_STATUS, L"Waiting for " + std::wstring(t.label) + L" window...");
         if (!WaitForWindow(pid, 90)) Log("[-] no window after 90s — injecting anyway");
         {
             HANDLE hw = OpenTarget(pid);
@@ -629,7 +635,7 @@ static bool EnsureInjected(HANDLE* hOut, DWORD* pidOut) {
     *pidOut = pid;
 
     HANDLE h = OpenTarget(pid);
-    if (!h) { Fail("OpenProcess (pid %lu)", pid); PostStr(WM_APP_DONE, L"OpenProcess failed"); return false; }
+    if (!h) { Fail("OpenProcess (pid %lu)", pid); PushEvent(L"[-] OpenProcess failed"); return false; }
 
     std::wstring modName;
     if (FindModuleBase(pid, &modName)) {
@@ -638,10 +644,10 @@ static bool EnsureInjected(HANDLE* hOut, DWORD* pidOut) {
         return true;
     }
 
-    PostStr(WM_APP_STATUS, L"Injecting EpsHax...");
+    PostStr(WM_APP_STATUS, L"Injecting EpsHax into " + std::wstring(t.label) + L"...");
     std::wstring dllW = PickDll();
     if (dllW.empty()) { Log("[-] no EpsHax DLL found next to launcher"); CloseHandle(h);
-                        PostStr(WM_APP_DONE, L"EpsHax DLL not found"); return false; }
+                        PushEvent(L"[-] EpsHax DLL not found"); return false; }
     Log("[+] DLL: %ls", dllW.c_str());
     if (!ProcessHasWindow(pid)) { Log("[*] waiting for window..."); WaitForWindow(pid, 90); }
     WaitForInputIdle(h, 10000);
@@ -651,14 +657,17 @@ static bool EnsureInjected(HANDLE* hOut, DWORD* pidOut) {
         DisableBlockDynamicCode(h, pid);
         RestoreNtProtectVirtualMemory(h, pid);
         if (!InjectDll(h, WideToAcp(dllW).c_str())) { CloseHandle(h);
-            PostStr(WM_APP_DONE, L"Injection failed"); return false; }
+            PushEvent(L"[-] injection failed"); return false; }
     }
     Sleep(4000);  // first frame: ImGui init, executor ready
     if (!FindModuleBase(pid, &modName)) { CloseHandle(h);
         Log("[-] EpsHax not in module list after inject");
-        PostStr(WM_APP_DONE, L"Injection failed (module missing)"); return false; }
+        PushEvent(L"[-] injection failed (module missing)"); return false; }
     *hOut = h;
     return true;
+}
+static bool EnsureInjected(HANDLE* hOut, DWORD* pidOut) {
+    return EnsureInjectedIdx(g_target, hOut, pidOut);
 }
 
 static bool ExecuteScript(HANDLE h, DWORD pid, const std::wstring& scriptPath) {
@@ -725,49 +734,77 @@ static void Worker(int kind, std::wstring scriptPath) {
                 PostStr(WM_APP_DONE, ok ? (L"Ran " + name) : (L"Failed: " + name));
             }
         }
-    } else {  // 0 = play (launch if needed), 1 = inject only
+    } else {  // 0 = play (both games), 1 = inject only (selected target)
         bool injectOnly = (kind == 1);
-        const TargetInfo& t = kTargets[g_target];
-        if (injectOnly && FindPids(t.proc).empty()) {
-            PostStr(WM_APP_DONE, std::wstring(t.label) + L" is not running — press Play");
-        } else {
+        int idxs[2] = { 0, 1 };
+        int n = 2;
+        if (injectOnly) { idxs[0] = g_target; n = 1; }
+        for (int k = 0; k < n; k++) {
+            const int idx = idxs[k];
+            const TargetInfo& t = kTargets[idx];
+            if (injectOnly && FindPids(t.proc).empty()) {
+                finalMsg = std::wstring(t.label) + L" is not running — press Play";
+                continue;
+            }
             HANDLE h = nullptr; DWORD pid = 0;
-            if (EnsureInjected(&h, &pid)) {
-                if (kind == 0) {
-                    // if the game is sitting at the login screen, click Play
+            if (!EnsureInjectedIdx(idx, &h, &pid)) {
+                if (!finalMsg.empty()) finalMsg += L" | ";
+                finalMsg += std::wstring(t.label) + L" failed (see Logs)";
+                continue;
+            }
+            if (kind == 0) {
+                if (idx == 0) {
+                    // Growtopia: probe world; click Play only when at login screen
                     std::wstring world;
                     if (ProbeWorld(h, pid, &world)) {
                         bool atLogin = world.empty() || world == L"?" || world == L"nil";
                         if (atLogin) {
-                            PostStr(WM_APP_STATUS, L"Clicking Play in game...");
-                            if (ClickGamePlay(pid)) {
-                                PushEvent(L"[*] clicked Play in game — logging in");
+                            PostStr(WM_APP_STATUS, L"Clicking Play in Growtopia...");
+                            if (ClickGamePlay(idx, pid)) {
+                                PushEvent(L"[*] clicked Play in Growtopia — logging in");
                                 Sleep(6000);
                             } else {
-                                PushEvent(L"[-] game window not found for login click");
+                                PushEvent(L"[-] Growtopia window not found for login click");
                             }
                         } else {
-                            PushEvent(L"[+] world: " + world);
+                            PushEvent(L"[+] Growtopia world: " + world);
                         }
                     } else {
-                        PushEvent(L"[-] world probe failed (log not readable yet)");
+                        PushEvent(L"[-] Growtopia world probe failed (log not readable yet)");
+                    }
+                } else {
+                    // Creative Growtopia: GetWorld() is dead on 1.47 — use its log
+                    if (CGLoggedIn(pid)) {
+                        PushEvent(L"[+] Creative Growtopia already logged in");
+                    } else {
+                        PostStr(WM_APP_STATUS, L"Logging in Creative Growtopia...");
+                        if (ClickGamePlay(idx, pid)) {
+                            PushEvent(L"[*] clicked Online + Connect in CG — waiting for login");
+                            Sleep(8000);
+                            PushEvent(CGLoggedIn(pid) ? L"[+] CG login OK" : L"[-] CG login not confirmed yet");
+                        } else {
+                            PushEvent(L"[-] CG window not found for login click");
+                        }
                     }
                 }
-                bool ran = false;
-                std::wstring autoName = g_auto[g_target];
-                if (kind == 0 && !autoName.empty()) {
-                    std::wstring sp = ScriptDir() + L"\\" + autoName;
-                    if (GetFileAttributesW(sp.c_str()) != INVALID_FILE_ATTRIBUTES) {
-                        PostStr(WM_APP_STATUS, L"Auto-running " + autoName + L"...");
-                        ran = ExecuteScript(h, pid, sp);
-                    }
-                }
-                finalMsg = std::wstring(t.label) + L" ready (pid " + std::to_wstring(pid) + L")";
-                if (ran) finalMsg += L" + " + g_auto[g_target];
-                PostStr(WM_APP_DONE, finalMsg);
-                CloseHandle(h);
             }
+            bool ran = false;
+            std::wstring autoName = g_auto[idx];
+            if (kind == 0 && !autoName.empty()) {
+                std::wstring sp = ScriptDirFor(idx) + L"\\" + autoName;
+                if (GetFileAttributesW(sp.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                    PostStr(WM_APP_STATUS, L"Auto-running " + autoName + L" in " + t.label + L"...");
+                    ran = ExecuteScript(h, pid, sp);
+                }
+            }
+            std::wstring m = std::wstring(t.label) + L" ready (pid " + std::to_wstring(pid) + L")";
+            if (ran) m += L" + " + autoName;
+            if (!finalMsg.empty()) finalMsg += L" | ";
+            finalMsg += m;
+            CloseHandle(h);
         }
+        if (finalMsg.empty()) finalMsg = L"done";
+        PostStr(WM_APP_DONE, finalMsg);
     }
     PostMessageW(g_hWnd, WM_APP_DONE, 0, 0);  // signals busy=0 (with null string)
 }
@@ -895,16 +932,19 @@ static std::wstring Utf8OrAcpToWide(const char* p, int n) {
     while (!w.empty() && (w.back() == L'\r' || w.back() == L'\n')) w.pop_back();
     return w;
 }
+// exe lives in <repo>\build\Debug → <repo>\package-scanner-output\...
+static std::wstring EpsHaxLogPath() {
+    wchar_t self[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, self, MAX_PATH);
+    return DirOf(DirOf(DirOf(self))) + L"\\package-scanner-output\\Cmd Log\\log.txt";
+}
 static std::wstring FindGameLog() {
     const wchar_t* rel[] = {
         L"\\package-scanner-output\\Cmd Log\\log.txt",   // launched with cwd=game dir
         L"\\log.txt",                                     // game's own log
     };
     std::wstring gameDir = DirOf(ExePath());
-    wchar_t self[MAX_PATH]{};
-    GetModuleFileNameW(nullptr, self, MAX_PATH);
-    // exe lives in <repo>\build\Debug → <repo>\package-scanner-output\...
-    std::wstring devDir = DirOf(DirOf(DirOf(self))) + L"\\package-scanner-output\\Cmd Log\\log.txt";
+    std::wstring devDir = EpsHaxLogPath();
     std::wstring best; FILETIME bestT{};
     auto consider = [&](const std::wstring& p) {
         if (p.empty()) return;
@@ -969,29 +1009,39 @@ static bool ProbeWorld(HANDLE h, DWORD pid, std::wstring* out) {
     fputs(src, f);
     fclose(f);
     if (!ExecuteScript(h, pid, probe)) return false;
+    Sleep(700);  // let log() flush — a read too early would see a stale [WPROBE]
+    // [WPROBE] is written by EpsHax into ITS log (hardcoded absolute path) —
+    // always check that file first; FindGameLog() may return the game's own
+    // newest-but-markerless log.txt, which used to make the probe fail and
+    // the login click get skipped.
+    auto tryPath = [&](const std::wstring& lg) -> bool {
+        if (lg.empty()) return false;
+        HANDLE hf = CreateFileW(lg.c_str(), GENERIC_READ,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                nullptr, OPEN_EXISTING, 0, nullptr);
+        if (hf == INVALID_HANDLE_VALUE) return false;
+        LARGE_INTEGER sz{};
+        GetFileSizeEx(hf, &sz);
+        DWORD take = sz.QuadPart > 262144 ? 262144 : (DWORD)sz.QuadPart;
+        LARGE_INTEGER off{}; off.QuadPart = sz.QuadPart - take;
+        SetFilePointerEx(hf, off, nullptr, FILE_BEGIN);
+        std::vector<char> buf(take + 1, 0);
+        DWORD rd = 0; ReadFile(hf, buf.data(), take, &rd, nullptr);
+        CloseHandle(hf);
+        std::string all(buf.data(), rd);
+        const std::string key = "[WPROBE] world=";
+        size_t pos = all.rfind(key);
+        if (pos == std::string::npos) return false;
+        size_t e = all.find_first_of("\r\n", pos + key.size());
+        std::string v = all.substr(pos + key.size(),
+                                   e == std::string::npos ? std::string::npos : e - (pos + key.size()));
+        *out = Utf8OrAcpToWide(v.c_str(), (int)v.size());
+        return true;
+    };
+    if (tryPath(EpsHaxLogPath())) return true;
     std::wstring lg = FindGameLog();
     if (lg.empty()) return false;
-    HANDLE hf = CreateFileW(lg.c_str(), GENERIC_READ,
-                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                            nullptr, OPEN_EXISTING, 0, nullptr);
-    if (hf == INVALID_HANDLE_VALUE) return false;
-    LARGE_INTEGER sz{};
-    GetFileSizeEx(hf, &sz);
-    DWORD take = sz.QuadPart > 262144 ? 262144 : (DWORD)sz.QuadPart;
-    LARGE_INTEGER off{}; off.QuadPart = sz.QuadPart - take;
-    SetFilePointerEx(hf, off, nullptr, FILE_BEGIN);
-    std::vector<char> buf(take + 1, 0);
-    DWORD rd = 0; ReadFile(hf, buf.data(), take, &rd, nullptr);
-    CloseHandle(hf);
-    std::string all(buf.data(), rd);
-    const std::string key = "[WPROBE] world=";
-    size_t pos = all.rfind(key);
-    if (pos == std::string::npos) return false;
-    size_t e = all.find_first_of("\r\n", pos + key.size());
-    std::string v = all.substr(pos + key.size(),
-                               e == std::string::npos ? std::string::npos : e - (pos + key.size()));
-    *out = Utf8OrAcpToWide(v.c_str(), (int)v.size());
-    return true;
+    return tryPath(lg);
 }
 
 // ── click Play in the game window (login screen → world) ───────────────
@@ -1006,7 +1056,7 @@ static BOOL CALLBACK FindBigWndCb(HWND w, LPARAM lp) {
     if (r.right - r.left >= 400 && r.bottom - r.top >= 300) { c->found = w; return FALSE; }
     return TRUE;
 }
-static bool ClickGamePlay(DWORD pid) {
+static bool ClickGamePlay(int idx, DWORD pid) {
     FindWndCtx c{ pid, nullptr };
     EnumWindows(FindBigWndCb, (LPARAM)&c);
     if (!c.found) return false;
@@ -1023,22 +1073,71 @@ static bool ClickGamePlay(DWORD pid) {
         Log("[-] could not bring game window to foreground");
         return false;
     }
+    auto clickAt = [&](int cx, int cy) -> bool {
+        POINT pt{ cx, cy };
+        if (!ClientToScreen(g, &pt)) return false;
+        SetCursorPos(pt.x - 40, pt.y);
+        Sleep(150);
+        SetCursorPos(pt.x, pt.y);
+        Sleep(200);
+        mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
+        Sleep(70);
+        mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
+        Log("[+] clicked at client (%d,%d)", cx, cy);
+        return true;
+    };
     RECT cr{};
     if (!GetClientRect(g, &cr)) return false;
     int cw = cr.right - cr.left, ch = cr.bottom - cr.top;
     if (cw < 400 || ch < 300) return false;
-    // "Play Online" button center, in client coords of the 1024x689 menu
-    POINT pt{ MulDiv(505, cw, 1024), MulDiv(388, ch, 689) };
-    if (!ClientToScreen(g, &pt)) return false;
-    SetCursorPos(pt.x - 40, pt.y);
-    Sleep(150);
-    SetCursorPos(pt.x, pt.y);
-    Sleep(200);
-    mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
-    Sleep(70);
-    mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
-    Log("[+] clicked Play in game at (%d,%d)", pt.x, pt.y);
-    return true;
+    if (idx == 1) {
+        // Creative Growtopia (960x640): main menu "Online" → GrowID dialog "Connect"
+        if (!clickAt(512, 389)) return false;
+        Sleep(6000);   // dialog fades in, credentials are prefilled
+        if (!clickAt(678, 572)) return false;
+        return true;
+    }
+    // Growtopia: "Play Online" button center, in client coords of the 1024x689 menu
+    return clickAt(MulDiv(505, cw, 1024), MulDiv(388, ch, 689));
+}
+// true when CG's own log shows "Login Packet:" written after this process
+// started (GetWorld() is dead on GT 1.47, so the log is the only signal)
+static bool CGLoggedIn(DWORD pid) {
+    std::wstring lg = GetLocalAppData() + L"\\CreativeGrowtopia\\log.txt";
+    FILETIME c{}, x{}, y{}, z{};
+    ULONGLONG start100 = 0;
+    HANDLE hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (hp) {
+        if (GetProcessTimes(hp, &c, &x, &y, &z)) {
+            ULARGE_INTEGER u{}; u.LowPart = c.dwLowDateTime; u.HighPart = c.dwHighDateTime;
+            start100 = u.QuadPart;
+        }
+        CloseHandle(hp);
+    }
+    WIN32_FILE_ATTRIBUTE_DATA f{};
+    if (!GetFileAttributesExW(lg.c_str(), GetFileExInfoStandard, &f)) return false;
+    if (start100) {
+        ULARGE_INTEGER w{}; w.LowPart = f.ftLastWriteTime.dwLowDateTime; w.HighPart = f.ftLastWriteTime.dwHighDateTime;
+        if (w.QuadPart + 20000000ULL < start100) return false;  // untouched since before launch
+    }
+    HANDLE hf = CreateFileW(lg.c_str(), GENERIC_READ,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                            nullptr, OPEN_EXISTING, 0, nullptr);
+    if (hf == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER sz{};
+    GetFileSizeEx(hf, &sz);
+    DWORD take = sz.QuadPart > 524288 ? 524288 : (DWORD)sz.QuadPart;
+    LARGE_INTEGER off{}; off.QuadPart = sz.QuadPart - take;
+    SetFilePointerEx(hf, off, nullptr, FILE_BEGIN);
+    std::vector<char> buf(take + 1, 0);
+    DWORD rd = 0; ReadFile(hf, buf.data(), take, &rd, nullptr);
+    CloseHandle(hf);
+    std::string all(buf.data(), rd);
+    // only content after the LAST session's launch marker counts
+    const char* launch = "Setting video mode";
+    size_t s = all.rfind(launch);
+    if (s == std::string::npos) return false;
+    return all.find("Login Packet:", s) != std::string::npos;
 }
 
 static void ShowPage(int idx) {
@@ -1204,10 +1303,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                         175, 250, 430, 250, p0, (HMENU)(INT_PTR)IDC_STATIC_AUTO,
                         GetModuleHandleW(nullptr), nullptr);
         CreateWindowExW(0, L"STATIC",
-                        L"Play: starts the game if needed, injects EpsHax, clicks Play in game to log in,\r\n"
-                        L"then runs the script selected above.  Scripts tab: manage .lua files.",
+                        L"Play: starts Growtopia AND Creative Growtopia (if closed), injects EpsHax into both,\r\n"
+                        L"clicks Play / Online+Connect to log each in, then runs each game's auto script.\r\n"
+                        L"Inject only / Run act on the selected radio target.  Scripts tab: manage .lua files.",
                         WS_CHILD | WS_VISIBLE,
-                        15, 282, 745, 44, p0, nullptr, GetModuleHandleW(nullptr), nullptr);
+                        15, 282, 745, 60, p0, nullptr, GetModuleHandleW(nullptr), nullptr);
 
         // ---- page 1: Scripts ----
         g_pages[1] = CreateWindowExW(0, L"STATIC", L"", WS_CHILD,
@@ -1429,6 +1529,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInst;
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wc.hIcon = LoadIconW(hInst, MAKEINTRESOURCEW(1));  // from launcher.rc (EpsHax icon)
     wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     wc.lpszClassName = L"EpsHaxLauncherWnd";
     RegisterClassW(&wc);

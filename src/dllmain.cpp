@@ -1508,11 +1508,13 @@ static void spy_ptup(epshook::SavedRegs* r) {
     uint32_t t0 = 0;
     static uint32_t s_lastT0 = 0xFFFFFFFFu;
     static DWORD s_t0LogT = 0;
+    static int s_t0Total = 0;
     if (SafeReadMem((uintptr_t)r->rdx, &t0, 4) && t0 != s_lastT0) {
         s_lastT0 = t0;
         DWORD nowT = GetTickCount();
-        if (!s_t0LogT || nowT - s_t0LogT >= 1000) {
+        if (s_t0Total < 40 && (!s_t0LogT || nowT - s_t0LogT >= 1000)) {
             s_t0LogT = nowT;
+            s_t0Total++;
             char b[80];
             snprintf(b, sizeof(b), "[SPY:PTUP] struct dword0=%u (change-tracked)", t0);
             consoleLog(b);
@@ -1897,7 +1899,8 @@ static void hk_SendPacket(int type, std::string* pkt, void* conn) {
     if (forward && o_SendPacket) o_SendPacket(type, pkt, conn);
 }
 
-// ── Live game-structure caches (dump-verified layout, image_mem.bin) ──────
+// ── Live game-structure caches (per-build dump-verified layouts) ───────────
+// Growtopia.exe (GT):
 // ctx    = call 0x140B2D9D0()  (global 0-arg getter, captured on game thread)
 // world  = *[ctx+0x110]
 //   world+0x90 / +0x94 : u32 width / height      (WorldTileMap header)
@@ -1906,11 +1909,25 @@ static void hk_SendPacket(int type, std::string* pkt, void* conn) {
 //   world+0x118        : world-object list sentinel ptr; first = *[sent];
 //     node+0 = next, entry @ node+0x10 = {s32 a, s32 b, u16 id, u8, u8,
 //                                          s32 seq, s32 c, s32 d}
+//   world+0x1F0/+0x200 : world name SSO / len
 // PlayerItems container @ ctx+0x210:
 //   +0x40 list sentinel ptr; node+0 = next;
 //   entry {u16 id @+0x10, u8 count @+0x12, u8 flags @+0x13}  (count <= 255)
+//
+// CreativeGrowtopia.exe (CG, small ASLR image — scanner::IsCreativeBuild()):
+// ctx    = *(*(base+0x3AC438) + 0xA98)      (no fn_GetCtx; see below)
+// world  = *[ctx+0x138]
+//   world+0x0C / +0x10 : u32 width / height (200x200 observed)
+//   world+0x18 / +0x20 : tile vector begin / end (stride 63 B/tile)
+//     tile+0 u16 flags, tile+4 u16 fg, tile+40 u16 bg (no wire words),
+//     tile+8 u16 idx (= y*w+x), x@+6 y@+7
+//   world+0x78         : world-object list sentinel ptr; first = *[sent];
+//     node+0 next, node+8 prev, entry @ node+0x10 =
+//     {f32 a, f32 x, f32 y, u16 id, u8, u8, s32 seq, s32 c, s32 d} (28 B)
+//   world+0x90/+0xA0   : world name SSO / len ("BFGOF" observed)
+//   inventory: container NOT yet located (v1 returns empty; TODO)
 // tile vector base/dims captured by SyncGameCaches — bothax SetTileFlags
-// writes the u16 flag word directly at begin + idx*0xF0 + 0x52
+// writes the u16 flag word directly at begin + idx*stride + flagsOff
 std::atomic<uintptr_t> g_TileBegin{0};
 std::atomic<int> g_TileW{0};
 std::atomic<int> g_TileH{0};
@@ -1952,8 +1969,11 @@ void SyncGameCaches(bool log) {
         }
     };
     if (!ctx) { syncFail("ctx"); return; }
+    const bool cg = scanner::IsCreativeBuild();
+    const uintptr_t stride = cg ? 63u : 0xF0u;
     uintptr_t world = 0;
-    if (!SafeReadMem(ctx + 0x110, &world, 8) || !world) { syncFail("world"); return; }
+    const uintptr_t kWorldOff = cg ? 0x138 : 0x110;
+    if (!SafeReadMem(ctx + kWorldOff, &world, 8) || !world) { syncFail("world"); return; }
     // world pointer changed (join / door change) — stale NPC list must go;
     // replaces the LoadFromMem hook on builds where that hook is unavailable
     static uintptr_t s_LastWorld = 0;
@@ -1964,27 +1984,34 @@ void SyncGameCaches(bool log) {
         gs.npcs.clear();
     }
     uint32_t w = 0, h = 0;
-    if (!SafeReadMem(world + 0x90, &w, 4) || !SafeReadMem(world + 0x94, &h, 4)) { syncFail("dims"); return; }
+    const uintptr_t kWOff = cg ? 0x0C : 0x90;
+    const uintptr_t kHOff = cg ? 0x10 : 0x94;
+    if (!SafeReadMem(world + kWOff, &w, 4) || !SafeReadMem(world + kHOff, &h, 4)) { syncFail("dims"); return; }
     if (w == 0 || h == 0 || w > 600 || h > 600 || (uint64_t)w * h > 66000) { syncFail("dims-range"); return; }
     uintptr_t begin = 0, end = 0;
-    SafeReadMem(world + 0xA0, &begin, 8);
-    SafeReadMem(world + 0xA8, &end, 8);
-    if (!begin || end <= begin || (end - begin) < (uintptr_t)w * h * 0xF0) { syncFail("span"); return; }
+    const uintptr_t kBeginOff = cg ? 0x18 : 0xA0;
+    const uintptr_t kEndOff = cg ? 0x20 : 0xA8;
+    SafeReadMem(world + kBeginOff, &begin, 8);
+    SafeReadMem(world + kEndOff, &end, 8);
+    if (!begin || end <= begin || (end - begin) < (uintptr_t)w * h * stride) { syncFail("span"); return; }
     g_TileBegin.store(begin, std::memory_order_relaxed);
     g_TileW.store((int)w, std::memory_order_relaxed);
     g_TileH.store((int)h, std::memory_order_relaxed);
 
-    // world name @ world+0x1F0 (MSVC std::string: inline ≤15 chars, else heap ptr)
+    // world name SSO (GT +0x1F0/+0x200; CG +0x90/+0xA0)
+    // (MSVC std::string: inline <=15 chars, else heap ptr)
+    const uintptr_t kNameOff = cg ? 0x90 : 0x1F0;
+    const uintptr_t kNameLenOff = cg ? 0xA0 : 0x200;
     char wname[32] = {};
     bool nameOk = false;
     {
         uint64_t nlen = 0;
-        if (SafeReadMem(world + 0x200, &nlen, 8) && nlen > 0 && nlen < sizeof(wname)) {
+        if (SafeReadMem(world + kNameLenOff, &nlen, 8) && nlen > 0 && nlen < sizeof(wname)) {
             if (nlen <= 15) {
-                SafeReadMem(world + 0x1F0, wname, (size_t)nlen);
+                SafeReadMem(world + kNameOff, wname, (size_t)nlen);
             } else {
                 uintptr_t nptr = 0;
-                if (SafeReadMem(world + 0x1F0, &nptr, 8) && nptr > 0x10000 && nptr < 0x7FFFFFFFFFFFull)
+                if (SafeReadMem(world + kNameOff, &nptr, 8) && nptr > 0x10000 && nptr < 0x7FFFFFFFFFFFull)
                     SafeReadMem(nptr, wname, (size_t)nlen);
             }
             wname[nlen] = 0;
@@ -1997,7 +2024,7 @@ void SyncGameCaches(bool log) {
     }
 
     size_t count = (size_t)w * h;
-    std::vector<uint8_t> raw(count * 0xF0);
+    std::vector<uint8_t> raw(count * stride);
     bool tilesOk = true;
     for (size_t off = 0; off < raw.size();) {
         size_t n = raw.size() - off;
@@ -2008,14 +2035,17 @@ void SyncGameCaches(bool log) {
 
     std::vector<std::vector<TileData>> tiles;
     if (tilesOk) {
+        const uintptr_t bgOff = cg ? 40u : 0x50u;
+        const uintptr_t wireOff = cg ? 0u : 0xC0u;
+        const uintptr_t flgOff = cg ? 0u : 0x52u;
         tiles.assign(h, std::vector<TileData>(w));
         for (size_t i = 0; i < count; i++) {
-            const uint8_t* t = raw.data() + i * 0xF0;
+            const uint8_t* t = raw.data() + i * stride;
             uint16_t w0 = 0, w1 = 0, w2 = 0, w3 = 0;
-            std::memcpy(&w0, t + 0x04, 2);   // fg  (set_fg writes +0x4)
-            std::memcpy(&w1, t + 0x50, 2);   // wire word 2
-            std::memcpy(&w2, t + 0xC0, 2);   // wire word 3
-            std::memcpy(&w3, t + 0x52, 2);   // wire word 4 (bg-like + flag bits)
+            std::memcpy(&w0, t + 0x04, 2);   // fg  (set_fg writes +0x4 on both)
+            std::memcpy(&w1, t + bgOff, 2);
+            if (wireOff) std::memcpy(&w2, t + wireOff, 2); else w2 = 0;
+            std::memcpy(&w3, t + flgOff, 2);
             TileData& td = tiles[(int)(i / w)][(int)(i % w)];
             td.fg = w0; td.bg = w1;
             td.extra = w2;
@@ -2025,29 +2055,51 @@ void SyncGameCaches(bool log) {
         }
     }
 
-    // world objects (list @ world+0x118 sentinel)
+    // world objects (list sentinel ptr @ world+0x118 GT / +0x78 CG)
     std::vector<WorldObject> objs;
     uintptr_t sent = 0;
-    if (SafeReadMem(world + 0x118, &sent, 8) && sent > 0x10000 && sent < 0x7FFFFFFFFFFFull) {
+    const uintptr_t kObjOff = cg ? 0x78 : 0x118;
+    if (SafeReadMem(world + kObjOff, &sent, 8) && sent > 0x10000 && sent < 0x7FFFFFFFFFFFull) {
         uintptr_t node = 0;
         if (SafeReadMem(sent, &node, 8)) {
             int guard = 0;
             while (node && node != sent && guard++ < 4096) {
-                struct RObj { float a, b; uint16_t id; uint8_t f1, f2; int32_t seq, c, d; } r{};
-                if (!SafeReadMem(node + 0x10, &r, sizeof r)) break;
                 WorldObject o;
-                o.id = r.id; o.oid = r.seq;
-                o.pos_x = r.a; o.pos_y = r.b;
-                o.count = r.c; o.flags = r.d;
-                objs.push_back(o);
+                bool push = false;
+                if (cg) {
+                    // {f32 a, f32 x, f32 y, u16 id, u8, u8, s32 seq, s32 c, s32 d}
+                    struct RObjC { float a, x, y; uint16_t id; uint8_t f1, f2; int32_t seq, c, d; } r{};
+                    if (SafeReadMem(node + 0x10, &r, sizeof r)) {
+                        // sentinel/foreign nodes fail this filter; real objects
+                        // sit in pixel coords (<= world span) with sane ids
+                        if (r.id > 0 && r.id < 20000 && r.x > -1e6f && r.x < 1e6f &&
+                            r.y > -1e6f && r.y < 1e6f) {
+                            o.id = r.id; o.oid = r.seq;
+                            o.pos_x = r.x; o.pos_y = r.y;
+                            o.count = r.c; o.flags = r.d;
+                            push = true;
+                        }
+                    }
+                } else {
+                    struct RObj { float a, b; uint16_t id; uint8_t f1, f2; int32_t seq, c, d; } r{};
+                    if (SafeReadMem(node + 0x10, &r, sizeof r)) {
+                        o.id = r.id; o.oid = r.seq;
+                        o.pos_x = r.a; o.pos_y = r.b;
+                        o.count = r.c; o.flags = r.d;
+                        push = true;
+                    }
+                }
+                if (push) objs.push_back(o);
                 if (!SafeReadMem(node, &node, 8)) break;
             }
         }
     }
 
-    // PlayerItems list (ctx+0x210 + 0x40 sentinel)
+    // PlayerItems list (ctx+0x210 + 0x40 sentinel) — GT layout only;
+    // CG inventory container not yet located (v1: stays empty, see header)
     std::vector<InventoryItem> inv;
     uintptr_t isent = 0;
+    if (!cg) {
     if (SafeReadMem(ctx + 0x210 + 0x40, &isent, 8) &&
         isent > 0x10000 && isent < 0x7FFFFFFFFFFFull) {
         uintptr_t node = 0;
@@ -2069,6 +2121,7 @@ void SyncGameCaches(bool log) {
             }
         }
     }
+    } // if (!cg)
 
     // capture sizes BEFORE swap empties the locals
     size_t nT = tilesOk ? (size_t)w * h : 0;
@@ -2090,8 +2143,9 @@ void SyncGameCaches(bool log) {
     }
 
     // one-shot raw dump of the inventory container head for layout triage
+    // (GT layout only — the CG container is not at ctx+0x210)
     static int s_Dbg = 0;
-    if (s_Dbg < 3) {
+    if (!cg && s_Dbg < 3) {
         uint8_t b[96] = {};
         if (SafeReadMem(ctx + 0x210, b, sizeof b)) {
             char line[420];
@@ -2110,7 +2164,7 @@ void SyncGameCaches(bool log) {
             char b[220];
             snprintf(b, sizeof(b),
                 "[SYNC] world=%s %ux%u cap=%zu tiles=%zu objs=%zu inv=%zu",
-                nameOk ? wname : "?", w, h, (size_t)((end - begin) / 0xF0),
+                nameOk ? wname : "?", w, h, (size_t)((end - begin) / stride),
                 nT, nO, nI);
             consoleLog(b);
         }
@@ -2330,12 +2384,16 @@ void TryInstallNativeHooks() {
 
     // TLS outbound plaintext chokepoint — dump-verified address (frame [4]
     // of the send stack): fn(ssl, data, len) with data = framed plaintext.
-    {
+    // GT-only absolute VA — patching it inside CreativeGrowtopia would write
+    // a spy into unrelated code (same class of bug as the disabled DISP spies).
+    if (scanner::g_GameImageSize >= 0x1400000ULL) {
         const unsigned long long kTlsOutFn = 0x1419EAEE0ULL;
         epshook::Status st = epshook::CreateSpy((void*)kTlsOutFn, spy_tlsout);
         snprintf(buf, sizeof(buf), "[SPY] TLSOUT @0x%llX: %s",
                  kTlsOutFn, epshook::StatusString(st));
         consoleLog(buf);
+    } else {
+        consoleLog("[SPY] TLSOUT skipped (non-GT build)");
     }
 
     // Legacy text-dispatcher candidates — DISABLED: patching these unknown

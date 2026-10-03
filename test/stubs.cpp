@@ -26,6 +26,11 @@ std::vector<std::pair<int, std::string>> g_SentText;
 std::vector<std::pair<int, std::vector<uint8_t>>> g_SentRaw;
 
 namespace scanner {
+// host-test values: no game ctx / no image base (lua_api falls back safely)
+uintptr_t fn_GetCtx = 0;
+uintptr_t g_GameBase = 0;
+size_t g_GameImageSize = 0;
+bool IsCreativeBuild() { return false; } // host tests exercise the GT layout
 void CallSendPacket(int type, const char* text) {
     g_SentText.push_back({type, text ? text : ""});
     printf("[SENT type=%d] %.120s\n", type, text ? text : "");

@@ -400,8 +400,11 @@ int main() {
         check("SendPacket captured", textSent("4", "action|test"));
         check("SendVariantList captured",
               textSent("4", "action|dialog\nfoo|bar"));
+        // bothax libgrowtopia.so builds "action|join_request" + "name|" —
+        // matches src/lua_bothax.cpp (the old join_room/type-2 expectation
+        // was stale)
         check("RequestJoinWorld captured",
-              textSent("2", "action|join_room\nname|TESTWORLD"));
+              textSent("3", "action|join_request\nname|TESTWORLD\ninvitedWorld|0"));
         check("SetItemSelected raw captured", rawSentByte0Value(10, 777));
         check("SendPacketRaw bothax raw captured", rawSentByte0Value(10, 555));
         check("send counters grew",

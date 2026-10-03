@@ -13,7 +13,7 @@ _DBG = r"C:\Users\LENOVO\Documents\groetopia\cv dl script\coems_executor\build\D
 # newest built DLL — EpsHax2/3.dll exist while other builds are file-locked
 # by loaded processes; EpsHax3 is the current instrumented build
 _candidates = [os.path.join(_DBG, n)
-                               for n in ("EpsHax9.dll", "EpsHax8.dll", "EpsHax7.dll", "EpsHax6.dll", "EpsHax5.dll", "EpsHax4.dll", "EpsHax3.dll", "EpsHax2.dll", "EpsHax.dll")]
+                               for n in ("EpsHax10.dll", "EpsHax9.dll", "EpsHax8.dll", "EpsHax7.dll", "EpsHax6.dll", "EpsHax5.dll", "EpsHax4.dll", "EpsHax3.dll", "EpsHax2.dll", "EpsHax.dll")]
 DLL_PATH = max((p for p in _candidates if os.path.isfile(p)),
                key=os.path.getmtime, default=_candidates[0])
 
@@ -50,8 +50,10 @@ if not _token_elevated():
     se.argtypes = [wt.HWND, wt.LPCWSTR, wt.LPCWSTR, wt.LPCWSTR,
                    wt.LPCWSTR, ctypes.c_int]
     se.restype = ctypes.c_void_p
-    rc = se(None, "runas", sys.executable,
-            '"%s" "%s"' % (__file__, NEW_PATH), None, 1)
+    args = '"%s" "%s"' % (__file__, NEW_PATH)
+    if TARGET_EXE:
+        args += ' "%s"' % TARGET_EXE  # keep target across elevation
+    rc = se(None, "runas", sys.executable, args, None, 1)
     print("ShellExecuteW runas rc=%d" % rc, flush=True)
     _write_out("ShellExecuteW runas rc=%d" % rc)
     sys.exit(0 if rc > 32 else 1)

@@ -176,4 +176,6 @@ namespace LuaHooks {
     bool dispatchVariant(const std::string& text);            // OnVariant
     bool dispatchSendPacket(int ptype, const std::string& text); // OnSendPacket
     bool dispatchSendPacketRaw(const void* data, int len);     // OnSendPacketRaw
+    // replay events parked by try-lock contention (must hold g_LuaMtx)
+    void drainPending();
 }

@@ -202,11 +202,20 @@ void GameState::parseTextPacket(const std::string& text, bool incoming) {
         }
     }
 
-    // Always log incoming text packet action for debugging
+    // Always log incoming text packet action for debugging — but bounded:
+    // play_sfx alone fires thousands/hour and drowns the shared log.
     if (incoming) {
-        std::string preview = text.substr(0, 150);
-        for (auto& c : preview) { if (c == '\n') c = '|'; }
-        consoleLog("[IN] action=[" + action + "] " + preview);
+        static std::map<std::string, int> s_InCap;
+        static int s_InTotal = 0;
+        int& n = s_InCap[action];
+        int cap = (action == "play_sfx") ? 6 : 8;
+        if (s_InTotal < 1500 && n < cap) {
+            n++;
+            s_InTotal++;
+            std::string preview = text.substr(0, 150);
+            for (auto& c : preview) { if (c == '\n') c = '|'; }
+            consoleLog("[IN] action=[" + action + "] " + preview);
+        }
     }
 
     if (action == "spawn" || action == "on_spawn") {

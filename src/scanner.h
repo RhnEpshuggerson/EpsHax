@@ -25,4 +25,7 @@ namespace scanner {
 
     extern uintptr_t g_GameBase;
     extern size_t g_GameImageSize;
+    // Growtopia.exe = large static image (>= 0x1400000);
+    // CreativeGrowtopia.exe = small ASLR image (< 0x1400000).
+    bool IsCreativeBuild();
 }

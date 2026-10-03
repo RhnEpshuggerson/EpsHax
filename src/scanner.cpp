@@ -39,6 +39,10 @@ namespace scanner {
     uintptr_t g_GameBase = 0;
     size_t g_GameImageSize = 0;
 
+    bool IsCreativeBuild() {
+        return g_GameImageSize != 0 && g_GameImageSize < 0x1400000ULL;
+    }
+
     bool HooksInstalled() { return g_Installed; }
 
     static FILE* g_scanLogFile = nullptr;
@@ -595,13 +599,22 @@ namespace scanner {
             Log("[SCAN] using Growtopia.exe ground-truth addresses");
         } else {
             // CreativeGrowtopia build — dump-verified RVAs rebased to ASLR base
+            //   fn_TankParser  base+0xCD500  (lea's 'spawn|' key at +0xE0; payload
+            //                    std::string at [rdx+0x20] — spy_tankp contract)
+            //   fn_SendPacket  base+0x1008F0 ("Client sending packet of type %d: %s";
+            //                    prologue saves ecx/rdx/r8 + [rdx+0x18] SSO cap check
+            //                    = (int, std::string*, void*) — hk_SendPacket/ABI;
+            //                    35/36 call sites pass literal type 2/3, the same
+            //                    idiom GT's 143 SendPacket callers use)
+            //   fn_LoadFromMem: absent in this build — SyncGameCaches' world-pointer
+            //                    change detect covers join/door resync instead
             fn_TextDispatch = base + 0xC6790ULL;
             fn_ProcessTankUpdatePacket = base + 0xCB030ULL;
-            fn_TankParser = 0;
-            fn_SendPacket = 0;
+            fn_TankParser = base + 0xCD500ULL;
+            fn_SendPacket = base + 0x1008F0ULL;
             fn_LoadFromMem = 0;
             fn_GetCtx = 0;
-            Log("[SCAN] using Creative-dump addresses (SendPacket unresolved)");
+            Log("[SCAN] using Creative-dump addresses (SendPacket=0x1008F0 TankParser=0xCD500)");
         }
 
         g_Installed = true;
@@ -662,8 +675,14 @@ namespace scanner {
         return result;
     }
 
+    static void rejectOnce(const char* why) {
+        static int s_n = 0;
+        if (s_n < 3) { s_n++; Log(why); }
+    }
+
     void CallSendPacket(int type, const char* text) {
-        if (!fn_SendPacket || !text) return;
+        if (!fn_SendPacket) { rejectOnce("[SEND] SendPacket unresolved on this build"); return; }
+        if (!text) return;
 
         memset(g_sendStrBuf, 0, 32);
         g_sendLen = strlen(text);
@@ -691,7 +710,8 @@ namespace scanner {
     }
 
     void CallSendPacketBin(int type, const void* data, size_t len) {
-        if (!fn_SendPacket || !data) return;
+        if (!fn_SendPacket) { rejectOnce("[SEND] SendPacket unresolved on this build"); return; }
+        if (!data) return;
 
         memset(g_sendStrBuf, 0, 32);
         g_sendLen = len;
@@ -723,6 +743,12 @@ namespace scanner {
 uintptr_t scanner::fn_RecvWrapper = 0;
 
 void scanner::ScanRecvWrapper() {
+    if (g_GameImageSize < 0x1400000ULL) {
+        // recvRetAddr below is a Growtopia.exe absolute VA — meaningless (and
+        // unmapped) inside CreativeGrowtopia; skip so fn_RecvWrapper stays 0.
+        Log("[SCAN] Recv wrapper scan skipped (non-GT build)");
+        return;
+    }
     uintptr_t recvRetAddr = 0x1419EBD08;
     char buf[256];
 

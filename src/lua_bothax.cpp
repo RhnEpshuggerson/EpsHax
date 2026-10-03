@@ -725,9 +725,13 @@ int LuaExecutor::lua_SetTileFlags(lua_State* L) {
     uintptr_t base = g_TileBegin.load(std::memory_order_relaxed);
     int w = g_TileW.load(std::memory_order_relaxed);
     int h = g_TileH.load(std::memory_order_relaxed);
+    // layout per build: GT stride 0xF0 flags@+0x52; Creative stride 63 flags@+0
+    const bool cg = scanner::IsCreativeBuild();
+    const uintptr_t stride = cg ? 63u : 0xF0u;
+    const uintptr_t flagsOff = cg ? 0u : 0x52u;
     bool ok = false;
     if (base && w > 0 && h > 0 && x >= 0 && y >= 0 && x < w && y < h) {
-        uintptr_t addr = base + ((uintptr_t)(y * w + x)) * 0xF0 + 0x52;
+        uintptr_t addr = base + ((uintptr_t)(y * w + x)) * stride + flagsOff;
         ok = tileFlagRw(addr, &nv, true);
     }
     if (ok) {
@@ -983,7 +987,61 @@ bool runHooks(lua_State* L, const char* ev,
     }
     return blocked;
 }
+
+// Events seen while another thread owns g_LuaMtx are parked here and
+// replayed on the next tick. A blocking wait on the packet/game thread was
+// a wedge source: the game window stops answering while tick() runs script
+// code (e.g. a 10 s MakeRequest) — the watchdog reads that as a hang.
+struct PendingEv {
+    int kind;                     // 0 variant, 1 send text, 2 send raw
+    std::string text;
+    int ptype = 0;
+    std::vector<uint8_t> raw;
+};
+std::mutex g_pendMtx;
+std::vector<PendingEv> g_pend;
+
+void enqueue(int kind, std::string text, int ptype, const void* raw, int rawLen) {
+    std::lock_guard<std::mutex> lk(g_pendMtx);
+    if (g_pend.size() >= 256) g_pend.erase(g_pend.begin());  // bound
+    PendingEv ev;
+    ev.kind = kind; ev.text = std::move(text); ev.ptype = ptype;
+    if (raw && rawLen > 0) {
+        const uint8_t* p = (const uint8_t*)raw;
+        ev.raw.assign(p, p + rawLen);
+    }
+    g_pend.push_back(std::move(ev));
+}
+
+// caller holds g_LuaMtx (drainPending/tick)
+bool runOne(const PendingEv& ev) {
+    LuaExecutor* ex = ready();
+    if (!ex) return false;
+    lua_State* L = ex->getLuaState();
+    if (!L) return false;
+    switch (ev.kind) {
+    case 0: return runHooks(L, "OnVariant", [&ev](lua_State* L2) {
+                pushVariantTable(L2, ev.text); return 1; });
+    case 1: return runHooks(L, "OnSendPacket", [&ev](lua_State* L2) {
+                lua_pushinteger(L2, ev.ptype);
+                lua_pushlstring(L2, ev.text.c_str(), ev.text.size());
+                return 2; });
+    case 2: return runHooks(L, "OnSendPacketRaw", [&ev](lua_State* L2) {
+                pushGUP(L2, ev.raw.data(), (int)ev.raw.size()); return 1; });
+    }
+    return false;
+}
 } // namespace
+
+void drainPending() {
+    if (t_HookDepth > 0) return;   // stay parked; we are inside a handler
+    std::vector<PendingEv> local;
+    {
+        std::lock_guard<std::mutex> lk(g_pendMtx);
+        local.swap(g_pend);
+    }
+    for (auto& ev : local) runOne(ev);
+}
 
 bool dispatchVariant(const std::string& text) {
     static int s_dv = 0;
@@ -997,7 +1055,13 @@ bool dispatchVariant(const std::string& text) {
         return false;
     }
     HookDepthGuard guard;
-    std::lock_guard<std::recursive_mutex> lk(g_LuaMtx);
+    std::unique_lock<std::recursive_mutex> lk(g_LuaMtx, std::try_to_lock);
+    if (!lk.owns_lock()) {
+        static int s_q = 0;
+        if (s_q < 4) { s_q++; debugLog("[DSPVAR] g_LuaMtx busy — event queued"); }
+        enqueue(0, text, 0, nullptr, 0);
+        return false;
+    }
     lua_State* L = ex->getLuaState();
     if (!L) return false;
     int nvar = 0;
@@ -1018,7 +1082,11 @@ bool dispatchSendPacket(int ptype, const std::string& text) {
     if (!ex) return false;
     if (t_HookDepth > 0) return false;
     HookDepthGuard guard;
-    std::lock_guard<std::recursive_mutex> lk(g_LuaMtx);
+    std::unique_lock<std::recursive_mutex> lk(g_LuaMtx, std::try_to_lock);
+    if (!lk.owns_lock()) {
+        enqueue(1, text, ptype, nullptr, 0);
+        return false;
+    }
     lua_State* L = ex->getLuaState();
     if (!L) return false;
     return runHooks(L, "OnSendPacket", [ptype, &text](lua_State* L2) {
@@ -1033,7 +1101,11 @@ bool dispatchSendPacketRaw(const void* data, int len) {
     if (!ex) return false;
     if (t_HookDepth > 0) return false;
     HookDepthGuard guard;
-    std::lock_guard<std::recursive_mutex> lk(g_LuaMtx);
+    std::unique_lock<std::recursive_mutex> lk(g_LuaMtx, std::try_to_lock);
+    if (!lk.owns_lock()) {
+        enqueue(2, std::string(), 0, data, len);
+        return false;
+    }
     lua_State* L = ex->getLuaState();
     if (!L) return false;
     return runHooks(L, "OnSendPacketRaw", [data, len](lua_State* L2) {

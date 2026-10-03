@@ -17,4 +17,7 @@ package-scanner-output/
 __pycache__/
 *.pyc
 watchdog.log
+watchdog.lock
 *.dmp
+log.txt
+*.old

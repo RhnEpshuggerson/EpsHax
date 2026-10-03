@@ -24,10 +24,34 @@ static std::mutex g_fileMtx;
 static void WriteToFile(const std::string& msg) {
     std::lock_guard<std::mutex> fl(g_fileMtx);
     if (!g_logFile) {
-        g_logFile = fopen("C:\\Users\\LENOVO\\Documents\\groetopia\\cv dl script\\coems_executor\\package-scanner-output\\Cmd Log\\log.txt", "w");
+        static const char kPath[] =
+            "C:\\Users\\LENOVO\\Documents\\groetopia\\cv dl script\\coems_executor\\package-scanner-output\\Cmd Log\\log.txt";
+        static const char kOld[] =
+            "C:\\Users\\LENOVO\\Documents\\groetopia\\cv dl script\\coems_executor\\package-scanner-output\\Cmd Log\\log.txt.old";
+        // rotate an oversized log instead of letting it grow unbounded
+        WIN32_FILE_ATTRIBUTE_DATA fad{};
+        if (GetFileAttributesExA(kPath, GetFileExInfoStandard, &fad) &&
+            fad.nFileSizeHigh == 0 && fad.nFileSizeLow > (32u << 20)) {
+            MoveFileExA(kPath, kOld, MOVEFILE_REPLACE_EXISTING);
+        }
+        // append (not truncate): GT and CG share this file — a boot in one
+        // process must not wipe the other's dumps
+        g_logFile = fopen(kPath, "a");
+        if (g_logFile) {
+            static char s_pid[16] = {};
+            if (!s_pid[0])
+                snprintf(s_pid, sizeof s_pid, "%lu",
+                         (unsigned long)GetCurrentProcessId());
+            fprintf(g_logFile, "[%s] ---- log open ----\n", s_pid);
+            fflush(g_logFile);
+        }
     }
     if (g_logFile) {
-        fprintf(g_logFile, "[%s] %s\n", "", msg.c_str());
+        static char s_pid[16] = {};
+        if (!s_pid[0])
+            snprintf(s_pid, sizeof s_pid, "%lu",
+                     (unsigned long)GetCurrentProcessId());
+        fprintf(g_logFile, "[%s] %s\n", s_pid, msg.c_str());
         fflush(g_logFile);
     }
 }
@@ -249,6 +273,7 @@ bool LuaExecutor::execute(const std::string& script) {
 void LuaExecutor::tick(float dt) {
     if (!running || !L) return;
     std::lock_guard<std::recursive_mutex> lk(g_LuaMtx);
+    LuaHooks::drainPending();   // replay events parked under lock contention
     float now = g_currentTime;
     lastTickTime = now;
 
